@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.oracle/
+browser-profile/
+chrome-profile/
+sessions/
+logs/
+tmp/
+*.log
+*.auth.json
+auth.json
+cookies*.json
+coverage/
+.DS_Store
+Thumbs.db

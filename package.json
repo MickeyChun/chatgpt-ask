@@ -1,0 +1,23 @@
+{
+  "name": "chatgpt-ask",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local ChatGPT browser-session CLI and MCP stdio server.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.4.0"
+  },
+  "bin": {
+    "chatgpt-ask": "./chatgpt-ask.mjs",
+    "chatgpt-ask-mcp": "./chatgpt-ask-mcp.mjs"
+  },
+  "scripts": {
+    "ask": "node ./chatgpt-ask.mjs",
+    "mcp": "node ./chatgpt-ask-mcp.mjs",
+    "check": "node --check chatgpt-ask.mjs && node --check chatgpt-ask-mcp.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MickeyChun/chatgpt-ask.git"
+  }
+}
