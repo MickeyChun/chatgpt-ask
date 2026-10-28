@@ -14,7 +14,8 @@
   "scripts": {
     "ask": "node ./chatgpt-ask.mjs",
     "mcp": "node ./chatgpt-ask-mcp.mjs",
-    "check": "node --check chatgpt-ask.mjs && node --check chatgpt-ask-mcp.mjs"
+    "check": "node --check chatgpt-ask.mjs && node --check chatgpt-ask-mcp.mjs && node --check chatgpt-composer.mjs && node --check chatgpt-read.mjs && node --check chatgpt-cdp.mjs && node --check chatgpt-process.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "repository": {
     "type": "git",

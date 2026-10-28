@@ -7,6 +7,7 @@
 //   chatgpt-ask.mjs "prompt" | --file f | -          send, then wait up to --timeout for the answer
 //   chatgpt-ask.mjs --no-wait "prompt"               send, print the conversation id, return at once
 //   chatgpt-ask.mjs --conversation <id>              do not send; wait for / fetch that conversation's answer
+//   chatgpt-ask.mjs --conversation <id> "prompt"     continue that conversation, then wait for the new answer
 //   chatgpt-ask.mjs --list [n]                       list recent conversations (default 15)
 // Options
 //   --timeout <sec>   how long to wait for the answer (default 240; 0 = check once)
@@ -24,6 +25,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { Cdp } from "./chatgpt-cdp.mjs";
+import { composerReadyExpr, focusComposerExpr, selectComposerContentsExpr, composerStateExpr } from "./chatgpt-composer.mjs";
+import { httpReadError, pollConversation } from "./chatgpt-read.mjs";
 
 const args = process.argv.slice(2);
 const opt = {
@@ -77,52 +81,19 @@ async function ensureChrome() {
   throw new Error("Chrome did not expose the debugging port in 40s");
 }
 
-class Cdp {
-  constructor(url) {
-    this.ws = new WebSocket(url);
-    this.id = 0;
-    this.pending = new Map();
-  }
-  async open() {
-    await new Promise((res, rej) => {
-      this.ws.onopen = res;
-      this.ws.onerror = () => rej(new Error("cdp websocket error"));
-    });
-    this.ws.onmessage = (m) => {
-      const d = JSON.parse(m.data);
-      if (d.id && this.pending.has(d.id)) {
-        this.pending.get(d.id)(d);
-        this.pending.delete(d.id);
-      }
-    };
-  }
-  send(method, params = {}) {
-    return new Promise((res) => {
-      const id = ++this.id;
-      this.pending.set(id, res);
-      this.ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
-  async eval(expression) {
-    const d = await this.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-    if (d.result?.exceptionDetails) throw new Error(d.result.exceptionDetails.text || "evaluate failed");
-    return d.result?.result?.value;
-  }
-  close() {
-    try {
-      this.ws.close();
-    } catch {}
-  }
-}
-
 // ---- page-side snippets -----------------------------------------------------------------
 
-const readConversationExpr = (id) => `(async () => {
+const readConversationExpr = (id, previousUserId = null, timeoutMs = 15000) => `(async () => {
   try {
-    const s = await (await fetch('/api/auth/session')).json();
-    if (!s.accessToken) return JSON.stringify({ state: 'noauth' });
-    const r = await fetch('/backend-api/conversation/${id}', { headers: { Authorization: 'Bearer ' + s.accessToken } });
-    if (!r.ok) return JSON.stringify({ state: 'http', status: r.status });
+    const failure = (${httpReadError.toString()});
+    const signal = AbortSignal.timeout(${Math.ceil(timeoutMs)});
+    const auth = await fetch('/api/auth/session', { signal });
+    if (!auth.ok) return JSON.stringify(failure(auth.status, auth.headers.get('Retry-After'), 'auth_session'));
+    const s = await auth.json();
+    if (!s.accessToken) return JSON.stringify({ state: 'noauth', retryable: false, message: 'Not signed in to ChatGPT in this Chrome profile' });
+    if (${JSON.stringify(id)} === null) return JSON.stringify({ state: 'ok' });
+    const r = await fetch('/backend-api/conversation/${id}', { signal, headers: { Authorization: 'Bearer ' + s.accessToken } });
+    if (!r.ok) return JSON.stringify(failure(r.status, r.headers.get('Retry-After')));
     const c = await r.json();
     const map = c.mapping || {};
     const chain = [];
@@ -131,6 +102,11 @@ const readConversationExpr = (id) => `(async () => {
     const msgs = chain.map((n) => n.message).filter(Boolean);
     const role = (m) => (m.author && m.author.role) || '';
     const lastUser = msgs.map(role).lastIndexOf('user');
+    const user = msgs[lastUser];
+    const userMessageId = user ? user.id : null;
+    if (${JSON.stringify(previousUserId)} !== null && userMessageId === ${JSON.stringify(previousUserId)}) {
+      return JSON.stringify({ state: 'awaiting_user_message', userMessageId });
+    }
     const after = msgs.slice(lastUser + 1);
     const textOf = (m) => (m.content && m.content.parts ? m.content.parts.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('\\n') : '').trim();
     const isText = (m) => m.content && (m.content.content_type === 'text' || m.content.content_type === 'multimodal_text');
@@ -170,30 +146,34 @@ const readConversationExpr = (id) => `(async () => {
     finalText = finalText.replace(/<text[^>]*>([\\s\\S]*?)<\\/text>/g, '$1');
     if (order.length) finalText += '\\n\\n---\\n来源：\\n' + order.map((e, i) => '[' + (i + 1) + '] ' + (e.title || e.url) + ' — ' + e.url).join('\\n');
     return JSON.stringify({
-      state, node: c.current_node, title: c.title || '', update: c.update_time || 0, created: c.create_time || 0,
+      state, userMessageId, node: c.current_node, title: c.title || '', update: c.update_time || 0, created: (user && user.create_time) || c.create_time || 0,
       steps: after.filter((m) => role(m) === 'tool').length, note,
       model: (modelMsg && modelMsg.metadata && modelMsg.metadata.model_slug) || null,
       text: finalText, parts: finals.length, sources: order.length,
     });
-  } catch (e) { return JSON.stringify({ state: 'error', message: String(e) }); }
+  } catch (e) { return JSON.stringify({ state: 'read_error', retryable: true, message: String(e) }); }
 })()`;
 
-const listConversationsExpr = (n) => `(async () => {
+const listConversationsExpr = (n, timeoutMs = 15000) => `(async () => {
   try {
-    const s = await (await fetch('/api/auth/session')).json();
-    if (!s.accessToken) return JSON.stringify({ state: 'noauth' });
-    const r = await fetch('/backend-api/conversations?offset=0&limit=${n}&order=updated', { headers: { Authorization: 'Bearer ' + s.accessToken } });
-    if (!r.ok) return JSON.stringify({ state: 'http', status: r.status });
+    const failure = (${httpReadError.toString()});
+    const signal = AbortSignal.timeout(${Math.ceil(timeoutMs)});
+    const auth = await fetch('/api/auth/session', { signal });
+    if (!auth.ok) return JSON.stringify(failure(auth.status, auth.headers.get('Retry-After'), 'auth_session'));
+    const s = await auth.json();
+    if (!s.accessToken) return JSON.stringify({ state: 'noauth', retryable: false, message: 'Not signed in to ChatGPT in this Chrome profile' });
+    const r = await fetch('/backend-api/conversations?offset=0&limit=${n}&order=updated', { signal, headers: { Authorization: 'Bearer ' + s.accessToken } });
+    if (!r.ok) return JSON.stringify(failure(r.status, r.headers.get('Retry-After'), 'conversation_list'));
     const j = await r.json();
     return JSON.stringify({ state: 'ok', items: (j.items || []).map((c) => ({ id: c.id, title: c.title, updated: c.update_time })) });
-  } catch (e) { return JSON.stringify({ state: 'error', message: String(e) }); }
+  } catch (e) { return JSON.stringify({ state: 'read_error', retryable: true, message: String(e) }); }
 })()`;
 
 // ---- tab helpers ---------------------------------------------------------------------------
 
 // A loaded chatgpt.com tab we can run fetch() in (cookies + Cloudflare context). Reuse an
 // existing one when possible; otherwise open one. `needComposer` is for sending.
-async function openTab({ needComposer }) {
+async function openTab({ needComposer, conversationId = null }) {
   await ensureChrome();
   let created = null;
   let info = null;
@@ -209,20 +189,21 @@ async function openTab({ needComposer }) {
   await tab.open();
   await tab.send("Page.enable");
   await tab.send("Runtime.enable");
-  const close = async () => {
+  const close = async ({ keepTab = false } = {}) => {
     tab.close();
-    if (created && !opt.keepTab) await fetch(`${base}/json/close/${created.id}`).catch(() => {});
+    if (created && !opt.keepTab && !keepTab) await fetch(`${base}/json/close/${created.id}`).catch(() => {});
   };
   if (created) {
-    await tab.send("Page.navigate", { url: "https://chatgpt.com/" });
+    const targetUrl = conversationId ? `https://chatgpt.com/c/${conversationId}` : "https://chatgpt.com/";
+    await tab.send("Page.navigate", { url: targetUrl });
     const readyExpr = needComposer
-      ? "!!document.querySelector('.ProseMirror') && document.readyState === 'complete'"
+      ? `${composerReadyExpr}${conversationId ? ` && location.pathname.endsWith(${JSON.stringify(`/c/${conversationId}`)})` : ""}`
       : "document.readyState === 'complete' && location.hostname === 'chatgpt.com'";
     let ready = false;
     for (let attempt = 0; attempt < 3 && !ready; attempt++) {
       if (attempt > 0) {
         log(`page not ready after 60s, reloading (attempt ${attempt + 1}/3)`);
-        await tab.send("Page.navigate", { url: "https://chatgpt.com/" });
+        await tab.send("Page.navigate", { url: targetUrl });
       }
       for (let i = 0; i < 60 && !ready; i++) {
         await sleep(1000);
@@ -239,34 +220,18 @@ async function openTab({ needComposer }) {
   return { tab, close };
 }
 
-// Poll until the final turn is complete (and stable) or the deadline passes.
-async function waitForAnswer(tab, convId, timeoutSec, startedAt) {
-  const deadline = Date.now() + timeoutSec * 1000;
+// Retry read-only transient failures, honoring server cooldowns and the deadline.
+async function readConversation(tab, convId, timeoutSec, { previousUserId = null, stopWhen, initialSnapshot } = {}) {
   let lastNote = "";
-  let doneNode = null;
-  let last = null;
-  for (;;) {
-    const r = JSON.parse(await tab.eval(readConversationExpr(convId)).catch(() => '{"state":"error"}'));
-    last = r;
-    if (r.state === "noauth") return r;
-    if (r.state === "done") {
-      // the final turn can arrive as several messages; accept only once it stops changing
-      if (doneNode === r.node) return r;
-      doneNode = r.node;
-    } else {
-      doneNode = null;
-      if (r.state === "empty") return r;
-    }
-    const note = `${r.state} steps=${r.steps ?? "-"}${r.note ? " | " + r.note.slice(0, 80) : ""}`;
-    if (note !== lastNote) {
-      log(note);
-      lastNote = note;
-    }
-    if (Date.now() >= deadline) break;
-    await sleep(doneNode ? 4000 : 3000);
-  }
-  last.elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-  return last;
+  return pollConversation({
+    read: async (timeoutMs) => JSON.parse(await tab.eval(readConversationExpr(convId, previousUserId, timeoutMs))),
+    timeoutSec, stopWhen, initialSnapshot,
+    onProgress: (r) => {
+      const note = `${r.state} steps=${r.steps ?? "-"}${r.note ? " | " + r.note.slice(0, 80) : ""}`;
+      if (note !== lastNote) { log(note); lastNote = note; }
+    },
+    onRetry: (r, delay) => log(`${r.state}${r.status ? ` HTTP ${r.status}` : ""}; retrying read in ${Math.ceil(delay / 1000)}s`),
+  });
 }
 
 function report(convId, r, startedAt) {
@@ -278,6 +243,12 @@ function report(convId, r, startedAt) {
     emit({ state: "empty", conversationId: convId, message: "the turn finished without any text" });
     log("the turn finished without any text");
     return 1;
+  }
+  if (!["pending", "awaiting_user_message"].includes(r.state)) {
+    const message = r.message || `ChatGPT read failed (${r.state})`;
+    emit({ ...r, conversationId: convId, message }, message);
+    log(message);
+    return r.state === "noauth" ? 3 : 1;
   }
   const progress = { searchSteps: r.steps ?? 0, lastNote: r.note || "", elapsedSec: Math.round((Date.now() - startedAt) / 1000) };
   if (r.created) progress.runningSec = Math.max(0, Math.round(Date.now() / 1000 - r.created)); // since the question was asked
@@ -291,15 +262,8 @@ function report(convId, r, startedAt) {
 async function modeList() {
   const { tab, close } = await openTab({ needComposer: false });
   try {
-    const r = JSON.parse(await tab.eval(listConversationsExpr(opt.list || 15)));
-    if (r.state === "noauth") {
-      log("not signed in to chatgpt.com in this Chrome profile");
-      return 3;
-    }
-    if (r.state !== "ok") {
-      log(`list failed: ${JSON.stringify(r)}`);
-      return 1;
-    }
+    const r = await pollConversation({ read: async (timeoutMs) => JSON.parse(await tab.eval(listConversationsExpr(opt.list || 15, timeoutMs))), timeoutSec: opt.timeout, stopWhen: () => true });
+    if (r.state !== "ok") return report(null, r, Date.now());
     const items = r.items.map((c) => ({ id: c.id, title: c.title, updated: c.updated }));
     if (opt.json) console.log(JSON.stringify({ state: "ok", conversations: items }));
     else for (const c of items) console.log(`${c.id}  ${c.updated || ""}  ${c.title || ""}`);
@@ -313,16 +277,7 @@ async function modeGet() {
   const startedAt = Date.now();
   const { tab, close } = await openTab({ needComposer: false });
   try {
-    const r = await waitForAnswer(tab, opt.conversation, opt.timeout, startedAt);
-    if (r.state === "noauth") {
-      log("not signed in to chatgpt.com in this Chrome profile");
-      return 3;
-    }
-    if (r.state === "http") {
-      emit({ state: "error", message: `conversation not found or not readable (HTTP ${r.status})` });
-      log(`conversation not readable: HTTP ${r.status}`);
-      return 1;
-    }
+    const r = await readConversation(tab, opt.conversation, opt.timeout);
     return report(opt.conversation, r, startedAt);
   } finally {
     await close();
@@ -331,34 +286,57 @@ async function modeGet() {
 
 async function modeSend(prompt) {
   const startedAt = Date.now();
-  const { tab, close } = await openTab({ needComposer: true });
+  const { tab, close } = await openTab({ needComposer: true, conversationId: opt.conversation });
+  let preserveDraft = false;
   try {
-    const auth = JSON.parse(await tab.eval(readConversationExpr("00000000-0000-0000-0000-000000000000")));
-    if (auth.state === "noauth") {
-      log("not signed in to chatgpt.com in this Chrome profile");
-      return 3;
+    const auth = await readConversation(tab, opt.conversation, Math.min(opt.timeout, 60), { stopWhen: () => true });
+    if (!["ok", "done", "empty", "pending"].includes(auth.state)) return report(opt.conversation, auth, startedAt);
+    let previousUserId = null;
+    if (opt.conversation) {
+      if (auth.state !== "done" && auth.state !== "empty") {
+        const message = auth.state === "pending"
+          ? "the previous turn is still running; use chatgpt_result or --conversation without a prompt before sending a follow-up"
+          : `conversation not readable (${auth.state}${auth.status ? `, HTTP ${auth.status}` : ""})`;
+        emit({ state: "error", conversationId: opt.conversation, message });
+        log(message);
+        return 1;
+      }
+      previousUserId = auth.userMessageId;
+      if (!previousUserId) throw new Error("could not identify the previous user message; nothing was sent");
     }
     await sleep(3000); // let the app finish booting before typing
-    await tab.eval("document.querySelector('.ProseMirror').focus()");
+    await tab.send("Page.bringToFront");
+    await tab.eval(selectComposerContentsExpr);
+    preserveDraft = true;
     await tab.send("Input.insertText", { text: prompt });
     await sleep(800);
 
-    let sent = false;
-    for (let i = 0; i < 30 && !sent; i++) {
-      sent = await tab.eval(`(() => {
-        const b = [...document.querySelectorAll('button')].find((x) => (x.getAttribute('aria-label') || '').trim() === 'Send' || x.getAttribute('data-testid') === 'send-button');
-        if (!b || b.disabled) return false;
-        b.click();
-        return true;
-      })()`);
-      if (!sent) await sleep(500);
+    let composer = null;
+    for (let i = 0; i < 30; i++) {
+      composer = await tab.eval(composerStateExpr(prompt, opt.conversation));
+      if (composer.state === "ready" || composer.state === "wrong_conversation" || composer.state === "draft_changed" || composer.state === "busy") break;
+      await sleep(500);
     }
-    if (!sent) {
-      log("could not find an enabled Send button");
+    if (composer.state === "ready") {
+      const pointer = { x: composer.x, y: composer.y, button: "left", clickCount: 1 };
+      await tab.send("Input.dispatchMouseEvent", { type: "mousePressed", ...pointer });
+      await tab.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...pointer });
+    } else if (composer.state === "missing_send_button") {
+      // No submit action has been attempted. Enter is a trusted fallback only when
+      // the complete draft is present and no known send button is disabled.
+      log("send button not recognized; submitting with Enter");
+      await tab.eval(focusComposerExpr);
+      const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+      await tab.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter });
+      await tab.send("Input.dispatchKeyEvent", { type: "keyUp", ...enter });
+    } else {
+      const message = `could not submit the prompt (${composer.state}); draft tab kept open. ${JSON.stringify(composer)}`;
+      emit({ state: "error", conversationId: opt.conversation, message });
+      log(message);
       return 1;
     }
-    log("sent; waiting for the conversation id");
-    let convId = null;
+    log("submit action dispatched; waiting for confirmation");
+    let convId = opt.conversation;
     for (let i = 0; i < 90 && !convId; i++) {
       await sleep(1000);
       const p = await tab.eval("location.pathname").catch(() => "");
@@ -366,26 +344,50 @@ async function modeSend(prompt) {
       if (m) convId = m[1];
     }
     if (!convId) {
-      log("sent, but the page never moved to a conversation URL");
+      const message = "Submission was not confirmed: the page never moved to a conversation URL. Draft tab kept open; inspect it before retrying.";
+      emit({ state: "error", message });
+      log(message);
       return 1;
     }
     log(`conversation ${convId}`);
+    let submitted;
+    {
+      // A click/keypress is not proof of submission. Confirm persistence for both
+      // new chats and follow-ups before accepting an answer or closing the tab.
+      submitted = await readConversation(tab, convId, 60, { previousUserId, stopWhen: r => !!r.userMessageId && r.userMessageId !== previousUserId });
+      const confirmed = !!submitted.userMessageId && submitted.userMessageId !== previousUserId;
+      if (!confirmed) {
+        if (!["pending", "awaiting_user_message"].includes(submitted.state)) {
+          submitted.message = `${submitted.message || 'Could not confirm submission'}. Submission may have succeeded; read this same conversation before retrying the prompt.`;
+          return report(convId, submitted, startedAt);
+        }
+        const message = "The submit action was dispatched but the new user message was not confirmed. Draft tab kept open; inspect the conversation before retrying to avoid a duplicate message.";
+        emit({ state: "error", conversationId: convId, message });
+        log(`${message} https://chatgpt.com/c/${convId}`);
+        return 1;
+      }
+    }
+    preserveDraft = false;
+    log("submission confirmed by the conversation API");
     if (opt.noWait) {
       await sleep(3000); // give the request time to reach the server before the tab goes away
       emit({ state: "started", conversationId: convId }, `started ${convId}`);
       return 0;
     }
-    const r = await waitForAnswer(tab, convId, opt.timeout, startedAt);
-    if (r.state === "noauth") return 3;
+    const r = await readConversation(tab, convId, opt.timeout, { previousUserId, initialSnapshot: submitted });
     return report(convId, r, startedAt);
   } finally {
-    await close();
+    await close({ keepTab: preserveDraft });
   }
 }
 
 async function main() {
   if (opt.list !== null) return modeList();
-  if (opt.conversation) return modeGet();
+  if (opt.conversation !== null) {
+    opt.conversation = String(opt.conversation ?? "").trim().replace(/^.*\/c\//, "").split(/[?#]/)[0].replace(/\/$/, "");
+    if (!/^[0-9a-f-]{20,}$/i.test(opt.conversation)) throw new Error("--conversation requires a valid conversation id or ChatGPT conversation URL");
+    if (!opt.file && rest.length === 0) return modeGet();
+  }
   let prompt = "";
   if (opt.file) prompt = fs.readFileSync(opt.file, "utf8");
   else if (rest[0] === "-") prompt = fs.readFileSync(0, "utf8");

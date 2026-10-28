@@ -6,7 +6,7 @@
 // open: chatgpt_ask waits at most `wait_sec`, then returns the conversation id; the model calls
 // chatgpt_result to keep waiting. Nothing is lost if a call returns early or the client gives up.
 
-import { spawn } from "node:child_process";
+import { runChild, processFailure } from "./chatgpt-process.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,13 +27,18 @@ const TOOLS = [
     name: "chatgpt_ask",
     description:
       "Ask ChatGPT (the signed-in web session in the local Oracle Chrome profile) and return its full answer, with web-search citations as [n] plus a source list. " +
-      "Use for web lookups, a second opinion, or when unsure. Put all needed context in the prompt (no file access). " +
+      "Prefer for web research with sources or a useful independent second opinion. Planning help follows the caller's preferences. Handle routine local work directly. Include necessary context (no local file access), omit secrets, and verify advice. " +
+      "Provide conversation_id to send a follow-up in that existing conversation with its context; omit it to start a new conversation. Wait for the previous turn to finish before sending a follow-up. " +
       "Quick answers take ~20-60s; deep reasoning with searches can take 10+ minutes. " +
       "If it is not finished within wait_sec this returns state=pending with a conversation_id: then call chatgpt_result ONCE with that id (do NOT resend the prompt, do NOT poll). " +
       "Uses whatever model/thinking effort is currently selected in that ChatGPT window; sends are serialized.",
     inputSchema: {
       type: "object",
-      properties: { prompt: { type: "string", description: "The full prompt to send to ChatGPT." }, wait_sec: ASK_WAIT_PROP },
+      properties: {
+        prompt: { type: "string", description: "The full prompt to send to ChatGPT." },
+        conversation_id: { type: "string", description: "Optional existing conversation id (or ChatGPT conversation URL) to continue. Omit to start a new conversation." },
+        wait_sec: ASK_WAIT_PROP,
+      },
       required: ["prompt"],
     },
   },
@@ -41,6 +46,7 @@ const TOOLS = [
     name: "chatgpt_result",
     description:
       "Wait for and fetch the answer of an existing ChatGPT conversation by id, without sending anything. " +
+      "Transient read failures retry with bounded backoff and server Retry-After. HTTP 429 means rate_limited, not a missing conversation; honor retryAfterSec before reading the same id again, and never resend the original prompt to recover a read failure. " +
       "This call itself blocks for up to ~7 minutes and returns the moment the answer is ready, so it is NOT meant to be polled: call it once, with the default wait. " +
       "If it comes back pending again, the question is simply still being researched (deep reasoning + search can take 10-15 minutes): call it once more at most, then report the status and the chatgpt.com link to the user instead of repeating checks. " +
       "Also use it to re-read an older conversation (ids from chatgpt_recent or a chatgpt.com/c/<id> URL).",
@@ -58,28 +64,7 @@ const TOOLS = [
 ];
 
 function runScript(argv, stdinText, killAfterMs) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [askScript, "--json", ...argv], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-    let out = "";
-    let err = "";
-    const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
-    }, killAfterMs);
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d));
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ code: -1, json: null, err: `failed to start chatgpt-ask: ${e.message}` });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      let json = null;
-      try { json = JSON.parse(out.trim().split("\n").pop()); } catch {}
-      resolve({ code, json, err: err.trim(), out });
-    });
-    if (stdinText !== null) child.stdin.end(stdinText);
-    else child.stdin.end();
-  });
+  return runChild(askScript, argv, stdinText, killAfterMs);
 }
 
 // ask: 30-300s (the page may need up to ~3 min to load first). result: always long, 180-420s; it
@@ -93,11 +78,20 @@ const fmtMin = (s) => (s >= 90 ? `${Math.round(s / 60)} min` : `${s}s`);
 const checks = new Map(); // conversationId -> number of pending replies handed out
 const inflight = new Map(); // conversationId -> promise of the running chatgpt_result
 
-function formatAnswerResult(r) {
+function formatAnswerResult(r, conversationId = null) {
   const j = r.json;
   if (j && j.state === "done") {
     checks.delete(j.conversationId);
     return { isError: false, text: j.answer, meta: { state: "done", conversationId: j.conversationId, model: j.model, sources: j.sources, parts: j.parts } };
+  }
+  if (j && ["rate_limited", "server_error", "read_error", "noauth", "forbidden", "not_found", "http_error"].includes(j.state)) {
+    const url = j.conversationId ? `https://chatgpt.com/c/${j.conversationId}` : null;
+    const retry = j.retryable ? `Retry reading the same conversation${j.retryAfterSec != null ? ` after at least ${j.retryAfterSec}s` : " later"}. Do not resend the prompt.` : "";
+    return {
+      isError: true,
+      text: [j.message || `ChatGPT read failed (${j.state})`, url ? `conversation_id: ${j.conversationId}\nlink: ${url}` : "", retry].filter(Boolean).join("\n"),
+      meta: { state: j.state, conversationId: j.conversationId, url, httpStatus: j.status, source: j.source, retryable: !!j.retryable, retryAfterSec: j.retryAfterSec, retryAttempts: j.retryAttempts },
+    };
   }
   if (j && j.state === "pending") {
     const p = j.progress || {};
@@ -120,12 +114,7 @@ function formatAnswerResult(r) {
       meta: { state: "pending", conversationId: j.conversationId, url, pendingReplies: n, ...p },
     };
   }
-  const why =
-    r.code === 3 ? "ChatGPT page not ready or not signed in (open the Oracle Chrome window and check)" :
-    j && j.state === "empty" ? "the turn finished without any text" :
-    j && j.message ? j.message : `chatgpt-ask exited with code ${r.code}`;
-  const tail = (r.err || r.out || "").split("\n").slice(-6).join("\n");
-  return { isError: true, text: `${why}\n${tail}`.trim() };
+  return processFailure(r, conversationId);
 }
 
 let askQueue = Promise.resolve();
@@ -134,10 +123,19 @@ async function callTool(name, a) {
   if (name === "chatgpt_ask") {
     const prompt = String(a?.prompt ?? "").trim();
     if (!prompt) return { isError: true, text: "prompt is empty" };
+    const id = a?.conversation_id === undefined ? null : String(a.conversation_id ?? "").trim().replace(/^.*\/c\//, "").split(/[?#]/)[0].replace(/\/$/, "");
+    if (id !== null && !/^[0-9a-f-]{20,}$/i.test(id)) return { isError: true, text: "conversation_id must be a valid conversation id or ChatGPT conversation URL" };
     const w = clampAsk(a?.wait_sec);
-    const run = askQueue.then(() => runScript(["--timeout", String(w), "-"], prompt, killMs(w)));
+    const run = askQueue.then(async () => {
+      if (id) {
+        // Let any reader of the previous turn finish before submitting the next one.
+        await inflight.get(id);
+        checks.delete(id);
+      }
+      return runScript([...(id ? ["--conversation", id] : []), "--timeout", String(w), "-"], prompt, killMs(w));
+    });
     askQueue = run.then(() => {}, () => {});
-    return formatAnswerResult(await run);
+    return formatAnswerResult(await run, id);
   }
   if (name === "chatgpt_result") {
     const id = String(a?.conversation_id ?? "").trim().replace(/^.*\/c\//, "");
@@ -149,7 +147,7 @@ async function callTool(name, a) {
       p = runScript(["--conversation", id, "--timeout", String(w)], null, killMs(w)).finally(() => inflight.delete(id));
       inflight.set(id, p);
     }
-    return formatAnswerResult(await p);
+    return formatAnswerResult(await p, id);
   }
   if (name === "chatgpt_recent") {
     const n = Math.min(Math.max(Number(a?.limit) || 10, 1), 50);
